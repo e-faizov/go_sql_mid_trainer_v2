@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go_sql_mid_trainer_v2/internal/domain"
@@ -30,7 +32,23 @@ func (r *Repo) DB() *sql.DB {
 //   - sql.ErrNoRows преобразуй в domain.ErrUserNotFound;
 //   - остальные ошибки оборачивай через fmt.Errorf с %w.
 func (r *Repo) GetUserByID(ctx context.Context, id int64) (domain.User, error) {
-	return domain.User{}, domain.ErrNotImplemented
+	if id <= 0 {
+		return domain.User{}, domain.ErrWrongID
+	}
+
+	var res domain.User
+
+	query := "SELECT id, name, email, created_at FROM users WHERE id = $1;"
+	row := r.db.QueryRowContext(ctx, query, id)
+	err := row.Scan(&res.ID, &res.Name, &res.Email, &res.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("query id: %d, %w", id, err)
+	}
+
+	return res, nil
 }
 
 // TODO #2.
@@ -47,7 +65,50 @@ func (r *Repo) GetUserByID(ctx context.Context, id int64) (domain.User, error) {
 //   - rows.Err после цикла;
 //   - пустой результат это не ошибка.
 func (r *Repo) SearchUsers(ctx context.Context, q string, limit int) ([]domain.User, error) {
-	return nil, domain.ErrNotImplemented
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	q = strings.TrimSpace(q)
+
+	var rows *sql.Rows
+	var err error
+
+	if len(q) == 0 {
+		query :=
+			`SELECT id, name, email, created_at
+		FROM users
+		ORDER BY created_at DESC, id DESC LIMIT $1;`
+		rows, err = r.db.QueryContext(ctx, query, limit)
+	} else {
+		query :=
+			`SELECT id, name, email, created_at
+		FROM users
+		WHERE name ILIKE $1 OR email ILIKE $1
+		ORDER BY created_at DESC, id DESC LIMIT $2;`
+		pattern := "%" + q + "%"
+		rows, err = r.db.QueryContext(ctx, query, pattern, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query q: '%s', %w", q, err)
+	}
+	defer rows.Close()
+
+	res := []domain.User{}
+	for rows.Next() {
+		tmp := domain.User{}
+
+		err = rows.Scan(&tmp.ID, &tmp.Name, &tmp.Email, &tmp.CreatedAt)
+		if err != nil {
+			return res, fmt.Errorf("rows scan %w", err)
+		}
+		res = append(res, tmp)
+	}
+
+	if err = rows.Err(); err != nil {
+		return res, fmt.Errorf("rows err %w", err)
+	}
+
+	return res, nil
 }
 
 // TODO #3.
@@ -70,7 +131,62 @@ func (r *Repo) SearchUsers(ctx context.Context, q string, limit int) ([]domain.U
 //   - если была лишняя строка, верни nextCursor по последнему возвращённому заказу;
 //   - QueryContext, rows.Close, rows.Err.
 func (r *Repo) ListOrdersCursor(ctx context.Context, userID int64, cursor *domain.OrderCursor, limit int) ([]domain.Order, *domain.OrderCursor, error) {
-	return nil, nil, domain.ErrNotImplemented
+	if userID <= 0 {
+		return nil, nil, domain.ErrWrongID
+	}
+
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	var rows *sql.Rows
+	var err error
+
+	if cursor == nil {
+		query := `SELECT id, user_id, status, created_at
+     FROM orders
+     WHERE user_id = $1
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2`
+		rows, err = r.db.QueryContext(ctx, query, userID, limit+1)
+	} else {
+		query := `SELECT id, user_id, status, created_at
+     FROM orders
+     WHERE user_id = $1
+	 AND (created_at, id) < ($2, $3)
+     ORDER BY created_at DESC, id DESC
+     LIMIT $4`
+		rows, err = r.db.QueryContext(ctx, query, userID, cursor.CreatedAt, cursor.ID, limit+1)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("query id: %d, %w", userID, err)
+	}
+
+	defer rows.Close()
+
+	var limitCount int
+	var newCursor *domain.OrderCursor
+	res := make([]domain.Order, 0, limit)
+	for rows.Next() {
+		var tmp domain.Order
+		err = rows.Scan(&tmp.ID, &tmp.UserID, &tmp.Status, &tmp.CreatedAt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rows scan id: %d, %w", userID, err)
+		}
+		limitCount++
+		if limitCount <= limit {
+			res = append(res, tmp)
+		} else {
+			newCursor = &domain.OrderCursor{}
+			newCursor.ID = res[len(res)-1].ID
+			newCursor.CreatedAt = res[len(res)-1].CreatedAt
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("rows err id: %d, %w", userID, err)
+	}
+
+	return res, newCursor, nil
 }
 
 // TODO #4.
@@ -86,7 +202,37 @@ func (r *Repo) ListOrdersCursor(ctx context.Context, userID int64, cursor *domai
 //   - сгруппируй в map[int64][]domain.OrderItem по OrderID;
 //   - rows.Close и rows.Err.
 func (r *Repo) ListItemsByOrderIDs(ctx context.Context, orderIDs []int64) (map[int64][]domain.OrderItem, error) {
-	return nil, domain.ErrNotImplemented
+	res := map[int64][]domain.OrderItem{}
+	if len(orderIDs) == 0 {
+		return res, nil
+	}
+
+	query := `SELECT id, order_id, name, qty, price_cents
+     FROM order_items
+     WHERE order_id = ANY($1)
+     ORDER BY order_id, id;`
+
+	rows, err := r.db.QueryContext(ctx, query, orderIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tmp domain.OrderItem
+		err = rows.Scan(&tmp.ID, &tmp.OrderID, &tmp.Name, &tmp.Qty, &tmp.PriceCents)
+		if err != nil {
+			return nil, fmt.Errorf("scan %w", err)
+		}
+		items := res[tmp.OrderID]
+		items = append(items, tmp)
+		res[tmp.OrderID] = items
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows scan %w", err)
+	}
+
+	return res, nil
 }
 
 // TODO #5.
