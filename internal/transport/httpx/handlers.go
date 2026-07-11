@@ -22,7 +22,28 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 //   - ошибки мапь через statusFromError/safeMessage;
 //   - успешный ответ JSON: {"users": [...]}.
 func (h *Handler) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	ctx := r.Context()
+
+	q := r.URL.Query().Get("q")
+	limit := parseLimit(r)
+
+	users, err := h.svc.SearchUsers(ctx, q, limit)
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	if users == nil {
+		users = []domain.User{}
+	}
+
+	res := struct {
+		Users []domain.User `json:"users"`
+	}{
+		Users: users,
+	}
+
+	writeJSON(w, http.StatusOK, res)
 }
 
 // TODO #13.
@@ -35,7 +56,23 @@ func (h *Handler) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
 //   - статус брать через statusFromError;
 //   - успешный ответ JSON с user.
 func (h *Handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	we := func(err error) {
+		writeError(w, statusFromError(err), safeMessage(err))
+	}
+
+	id, err := parsePositiveInt64(r.PathValue("id"))
+	if err != nil {
+		we(err)
+		return
+	}
+
+	user, err := h.svc.GetUser(r.Context(), id)
+	if err != nil {
+		we(err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, user)
 }
 
 // TODO #14.
@@ -48,7 +85,26 @@ func (h *Handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
 //   - вызвать h.svc.GetOrdersWithItems;
 //   - успешный ответ JSON domain.OrderPage.
 func (h *Handler) handleListOrders(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	userID, err := parsePositiveInt64(r.PathValue("id"))
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	limit := parseLimit(r)
+	cursor, err := parseCursor(r)
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	page, err := h.svc.GetOrdersWithItems(r.Context(), userID, cursor, limit)
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, page)
 }
 
 // TODO #15.
@@ -62,7 +118,22 @@ func (h *Handler) handleListOrders(w http.ResponseWriter, r *http.Request) {
 //   - успешный статус 201;
 //   - если повтор idempotency вернул уже существующий transfer, 200 тоже допустим, но для простоты можно 201.
 func (h *Handler) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not implemented")
+
+	transferRequest := domain.TransferRequest{}
+	err := json.NewDecoder(r.Body).Decode(&transferRequest)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad request")
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+
+	transfer, err := h.svc.Transfer(r.Context(), transferRequest, idempotencyKey)
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, transfer)
 }
 
 // TODO #16.
@@ -73,7 +144,19 @@ func (h *Handler) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 //   - ошибки мапить безопасно;
 //   - успешный JSON.
 func (h *Handler) handleRiskSummary(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	userID, err := parsePositiveInt64(r.PathValue("id"))
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	risk, err := h.svc.RiskSummary(r.Context(), userID)
+	if err != nil {
+		writeError(w, statusFromError(err), safeMessage(err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, risk)
 }
 
 func (h *Handler) handleExternalRiskMock(w http.ResponseWriter, r *http.Request) {
