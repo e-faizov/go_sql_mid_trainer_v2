@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 
 	"go_sql_mid_trainer_v2/internal/domain"
@@ -31,9 +30,74 @@ const (
 //   - не допускай goroutine leak;
 //   - если ctx отменён до ошибок, верни ctx.Err().
 func RunPool(ctx context.Context, workers int, jobs <-chan domain.EmailJob, mode ErrorMode, handle Handler) error {
-	return domain.ErrNotImplemented
-}
+	if workers <= 0 {
+		workers = 1
+	}
 
-var _ = sync.Mutex{}
-var _ = errors.Join
-var _ = fmt.Errorf
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var resError error
+	chErr := make(chan error, workers)
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case emailJob, ok := <-jobs:
+					if !ok {
+						return
+					}
+
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					err := handle(ctx, emailJob)
+					if err != nil {
+						chErr <- err
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(chErr)
+	}()
+
+	allErrors := []error{}
+
+loop:
+	for {
+		err, ok := <-chErr
+		if ok {
+			if mode == FailFast {
+				if err != nil && resError == nil {
+					resError = err
+					cancel()
+				}
+			} else {
+				allErrors = append(allErrors, err)
+			}
+		} else {
+			break loop
+		}
+	}
+
+	if len(allErrors) != 0 {
+		resError = errors.Join(allErrors...)
+	} else if err := ctx.Err(); resError == nil && err != nil {
+		resError = err
+	}
+
+	return resError
+}
