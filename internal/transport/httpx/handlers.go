@@ -2,10 +2,7 @@ package httpx
 
 import (
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
-	"strconv"
 
 	"go_sql_mid_trainer_v2/internal/domain"
 )
@@ -188,11 +185,3 @@ func (h *Handler) handleExternalRiskMock(w http.ResponseWriter, r *http.Request)
 		Score:  score,
 	})
 }
-
-// Эти var нужны только чтобы файл компилировался, пока handlers ещё TODO.
-// Уберёшь, когда реализуешь функции выше. Да, костыль, но честный тренировочный.
-var _ = json.NewDecoder
-var _ = errors.Is
-var _ = fmt.Errorf
-var _ = strconv.ParseInt
-var _ = domain.TransferRequest{}
