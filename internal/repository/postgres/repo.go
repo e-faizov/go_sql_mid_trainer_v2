@@ -249,8 +249,180 @@ func (r *Repo) ListItemsByOrderIDs(ctx context.Context, orderIDs []int64) (map[i
 //   - вставь transfer и верни созданную запись;
 //   - все технические ошибки wrap через %w;
 //   - sql.ErrNoRows для account можно преобразовать в domain.ErrWrongID.
+
+func transferExists(ctx context.Context, tx *sql.Tx, idempotencyKey string) (domain.Transfer, bool, error) {
+	var res domain.Transfer
+	query := `SELECT id, from_account_id, to_account_id, amount_cents, idempotency_key, created_at
+				FROM transfers
+				WHERE idempotency_key = $1;`
+
+	row := tx.QueryRowContext(ctx, query, idempotencyKey)
+
+	err := row.Scan(&res.ID, &res.FromAccountID, &res.ToAccountID,
+		&res.AmountCents, &res.IdempotencyKey, &res.CreatedAt)
+	if err == nil {
+		return res, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return domain.Transfer{}, false, fmt.Errorf("rows scan %w", err)
+	}
+	return domain.Transfer{}, false, nil
+}
+
+func blockAndCheckBalances(ctx context.Context, tx *sql.Tx, req domain.TransferRequest) error {
+	balances := map[int64]int64{}
+	firstID := req.FromAccountID
+	secondID := req.ToAccountID
+	if firstID > secondID {
+		firstID, secondID = secondID, firstID
+	}
+	query :=
+		`SELECT id, balance_cents
+			FROM accounts
+			WHERE id IN ($1, $2)
+			ORDER BY id
+			FOR UPDATE;`
+
+	rows, err := tx.QueryContext(ctx, query, firstID, secondID)
+	if err != nil {
+		return fmt.Errorf("read balances from: %d, to: %d, %w", req.FromAccountID, req.ToAccountID, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, balance int64
+		err := rows.Scan(&id, &balance)
+		if err != nil {
+			return fmt.Errorf("scan balances from: %d, to: %d, %w", req.FromAccountID, req.ToAccountID, err)
+		}
+		balances[id] = balance
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("scan balances (rows.err) from: %d, to: %d, %w", req.FromAccountID, req.ToAccountID, err)
+	}
+
+	if len(balances) != 2 {
+		return domain.ErrWrongID
+	}
+
+	fromBalance, ok := balances[req.FromAccountID]
+	if !ok {
+		return domain.ErrWrongID
+	}
+	if fromBalance < req.AmountCents {
+		return domain.ErrInsufficientFunds
+
+	}
+	return nil
+}
+
+func updateBalances(ctx context.Context, tx *sql.Tx, req domain.TransferRequest) error {
+	query := `UPDATE accounts
+			SET balance_cents = balance_cents - $1
+			WHERE id = $2;`
+	result, err := tx.ExecContext(ctx, query, req.AmountCents, req.FromAccountID)
+	if err != nil {
+		return fmt.Errorf("update balance from: %d, %w", req.FromAccountID, err)
+	}
+	rowsAff, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected from: %d, %w", req.FromAccountID, err)
+	}
+	if rowsAff != 1 {
+		return fmt.Errorf("wrong rows affected from: %d", req.FromAccountID)
+	}
+	query = `UPDATE accounts
+			SET balance_cents = balance_cents + $1
+			WHERE id = $2;`
+	result, err = tx.ExecContext(ctx, query, req.AmountCents, req.ToAccountID)
+	if err != nil {
+		return fmt.Errorf("update balance to: %d, %w", req.ToAccountID, err)
+	}
+	rowsAff, err = result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected to: %d, %w", req.ToAccountID, err)
+	}
+	if rowsAff != 1 {
+		return fmt.Errorf("wrong rows affected to: %d", req.ToAccountID)
+	}
+	return nil
+}
+
 func (r *Repo) CreateTransferTx(ctx context.Context, req domain.TransferRequest, idempotencyKey string) (domain.Transfer, error) {
-	return domain.Transfer{}, domain.ErrNotImplemented
+
+	if req.AmountCents <= 0 ||
+		req.FromAccountID <= 0 ||
+		req.ToAccountID <= 0 ||
+		req.FromAccountID == req.ToAccountID {
+		return domain.Transfer{}, domain.ErrInvalidInput
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return domain.Transfer{}, domain.ErrIdempotencyMissing
+	}
+
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return domain.Transfer{}, fmt.Errorf("begin tx err %w", err)
+	}
+	defer tx.Rollback()
+
+	var res domain.Transfer
+
+	res, found, err := transferExists(ctx, tx, idempotencyKey)
+	if err != nil {
+		return domain.Transfer{}, err
+	}
+	if found {
+		return res, nil
+	}
+
+	err = blockAndCheckBalances(ctx, tx, req)
+	if err != nil {
+		return domain.Transfer{}, err
+	}
+
+	err = updateBalances(ctx, tx, req)
+	if err != nil {
+		return domain.Transfer{}, err
+	}
+
+	query := `INSERT INTO transfers (
+			    from_account_id,
+			    to_account_id,
+			    amount_cents,
+ 			   idempotency_key
+			)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (idempotency_key) DO NOTHING
+			RETURNING id, from_account_id, to_account_id, amount_cents, idempotency_key, created_at;`
+	row := tx.QueryRowContext(ctx, query, req.FromAccountID, req.ToAccountID, req.AmountCents, idempotencyKey)
+	err = row.Scan(&res.ID, &res.FromAccountID, &res.ToAccountID, &res.AmountCents, &res.IdempotencyKey, &res.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			query = `SELECT id, from_account_id, to_account_id, amount_cents, idempotency_key, created_at
+				FROM transfers
+				WHERE idempotency_key = $1;`
+			row := tx.QueryRowContext(ctx, query, idempotencyKey)
+			err = row.Scan(&res.ID, &res.FromAccountID, &res.ToAccountID,
+				&res.AmountCents, &res.IdempotencyKey, &res.CreatedAt)
+			if err != nil {
+				return domain.Transfer{},
+					fmt.Errorf("select created transfer key: %s, %w", idempotencyKey, err)
+
+			}
+			return res, nil
+		}
+		return domain.Transfer{},
+			fmt.Errorf("insert new transfer from: %d, to: %d, %w", req.FromAccountID, req.ToAccountID, err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return domain.Transfer{},
+			fmt.Errorf("commit tx from: %d, to: %d, %w", req.FromAccountID, req.ToAccountID, err)
+	}
+
+	return res, nil
 }
 
 // TODO #6.
