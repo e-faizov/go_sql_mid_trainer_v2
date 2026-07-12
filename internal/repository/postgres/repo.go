@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"go_sql_mid_trainer_v2/internal/domain"
 )
@@ -439,9 +438,7 @@ func (r *Repo) CreateTransferTx(ctx context.Context, req domain.TransferRequest,
 //   - rows.Close, rows.Err;
 //   - пустой список это не ошибка.
 func (r *Repo) LeaseEmailJobs(ctx context.Context, limit int) ([]domain.EmailJob, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
+	limit = normalizeLimit(limit)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx %w", err)
@@ -516,7 +513,32 @@ func (r *Repo) LeaseEmailJobs(ctx context.Context, limit int) ([]domain.EmailJob
 //   - ExecContext;
 //   - проверь RowsAffected: если 0, верни domain.ErrOrderNotFound или domain.ErrWrongID.
 func (r *Repo) FinishEmailJob(ctx context.Context, jobID int64, status string) error {
-	return domain.ErrNotImplemented
+	if jobID <= 0 {
+		return domain.ErrWrongID
+	}
+
+	status = strings.TrimSpace(status)
+	if status != "done" && status != "queued" {
+		return domain.ErrInvalidInput
+	}
+
+	query := `update email_jobs
+		set status=$1,
+			updated_at = now()
+		where id=$2`
+	result, err := r.db.ExecContext(ctx, query, status, jobID)
+	if err != nil {
+		return fmt.Errorf("exec query %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("exec query row affected err: %w", err)
+	}
+	if count == 0 {
+		return domain.ErrWrongID
+	}
+
+	return nil
 }
 
 func normalizeLimit(limit int) int {
@@ -525,8 +547,3 @@ func normalizeLimit(limit int) int {
 	}
 	return limit
 }
-
-// ensure imports stay useful while TODOs are stubs. Уберёшь это, когда реализуешь методы.
-var _ = fmt.Errorf
-var _ = sql.ErrNoRows
-var _ = time.Time{}

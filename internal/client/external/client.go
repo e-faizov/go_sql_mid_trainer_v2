@@ -39,11 +39,38 @@ func New(baseURL string, client *http.Client) *Client {
 //   - json.NewDecoder(resp.Body).Decode(&profile);
 //   - ошибки создания запроса, Do и Decode оборачивай через %w.
 func (c *Client) GetRiskProfile(ctx context.Context, userID int64) (domain.RiskProfile, error) {
-	return domain.RiskProfile{}, domain.ErrNotImplemented
-}
+	if userID <= 0 {
+		return domain.RiskProfile{}, domain.ErrWrongID
+	}
 
-var _ = json.NewDecoder
-var _ = fmt.Errorf
-var _ = io.LimitReader
-var _ = http.NewRequestWithContext
-var _ = strconv.FormatInt
+	url := c.baseURL + "/external/risk/" + strconv.FormatInt(userID, 10)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return domain.RiskProfile{}, fmt.Errorf("new request err: %w", err)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return domain.RiskProfile{}, fmt.Errorf("send request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		maxSize := 4 * 1024
+		limitedReader := io.LimitReader(resp.Body, int64(maxSize))
+		data, err := io.ReadAll(limitedReader)
+		if err != nil {
+			return domain.RiskProfile{}, fmt.Errorf("read limited body error: %w", err)
+		}
+
+		return domain.RiskProfile{}, fmt.Errorf("status %d, data: %s", resp.StatusCode, string(data))
+	}
+
+	var profile domain.RiskProfile
+	err = json.NewDecoder(resp.Body).Decode(&profile)
+	if err != nil {
+		return domain.RiskProfile{}, fmt.Errorf("parse response body error: %w", err)
+	}
+
+	return profile, nil
+}
