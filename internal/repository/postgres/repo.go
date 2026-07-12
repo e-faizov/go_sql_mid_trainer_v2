@@ -439,7 +439,72 @@ func (r *Repo) CreateTransferTx(ctx context.Context, req domain.TransferRequest,
 //   - rows.Close, rows.Err;
 //   - пустой список это не ошибка.
 func (r *Repo) LeaseEmailJobs(ctx context.Context, limit int) ([]domain.EmailJob, error) {
-	return nil, domain.ErrNotImplemented
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx %w", err)
+	}
+	defer tx.Rollback()
+
+	res := make([]domain.EmailJob, 0, limit)
+	resIDs := make([]int64, 0, limit)
+
+	err = func() error {
+		query := `SELECT id, user_id, kind FROM email_jobs
+     		WHERE status = 'queued'
+     		ORDER BY id
+     		LIMIT $1
+     		FOR UPDATE SKIP LOCKED;`
+		rows, err := tx.QueryContext(ctx, query, limit)
+		if err != nil {
+			return fmt.Errorf("select from email_jobs, %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var tmp domain.EmailJob
+			err = rows.Scan(&tmp.ID, &tmp.UserID, &tmp.Kind)
+			if err != nil {
+				return fmt.Errorf("scan emailjobx, %w", err)
+			}
+			res = append(res, tmp)
+			resIDs = append(resIDs, tmp.ID)
+		}
+		if err = rows.Err(); err != nil {
+			return fmt.Errorf("scan emailjobx rows.err, %w", err)
+		}
+
+		return nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if len(resIDs) != 0 {
+		query := `update email_jobs
+				set status='processing',
+					attempts = attempts + 1,
+					updated_at = now()
+				where id=any($1)
+				AND status = 'queued';`
+		result, err := tx.ExecContext(ctx, query, resIDs)
+		if err != nil {
+			return nil, fmt.Errorf("update email jobs, %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("update email jobs, check rows affected, %w", err)
+		}
+		if count != int64(len(resIDs)) {
+			return nil, fmt.Errorf("update email jobs: rows affected %d, want %d", count, len(resIDs))
+		}
+	}
+	err = tx.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("tx commit, %w", err)
+	}
+	return res, nil
 }
 
 // TODO #7.
